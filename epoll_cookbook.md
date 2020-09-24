@@ -1,7 +1,7 @@
 <center>Epoll原理详解&入门例子</center>
 
 # Epoll 的出现
-想必能搜到这篇文章的，应该对 select/poll 有一些了解和认识，一般说 epoll 都会与 select/poll 进行一些对比。epoll 是 linux 内核 2.6 之后出现的，是一种 IO 多路复用机制。
+想必能搜到这篇文章的，应该对 select/poll 有一些了解和认识，一般说 epoll 都会与 select/poll 进行一些对比，select、poll 和 epoll 都是一种 IO 多路复用机制。
 
 
 ## select 的问题
@@ -25,7 +25,7 @@ epoll 是 linux 内核 2.6 之后支持的，epoll 同 select/poll 一样，也�
 # Epoll 反应堆
 
 ## epoll 原理
-> 要完整描述 epoll 的原理，需要涉及到内核、网卡、中断、软中断、协议栈、套接字等知识，本文尽量从比较全面的角度来分析 epoll 的原理。
+> **要完整描述 epoll 的原理，需要涉及到内核、网卡、中断、软中断、协议栈、套接字等知识，本文尽量从比较全面的角度来分析 epoll 的原理**。
 
 上面其实讨论了 select/poll 几个缺点，针对这几个缺点，就需要解决以下几件事：
 
@@ -36,25 +36,269 @@ epoll 是 linux 内核 2.6 之后支持的，epoll 同 select/poll 一样，也�
 
 针对第一点：**如何突破文件描述符数量的限制**，其实 poll 已经解决了，poll 使用的是链表的方式管理 socket 描述符，但问题是不够高效，如果有百万级别的连接需要管理，如何快速的插入和删除就变得很重要，于是 epoll 采用了红黑树的方式进行管理，这样能保证在添加 socket 和删除 socket 时，有 O(log(n)) 的复杂度。
 
-针对第二点：**如何避免用户态和内核态对文件描述符集合的拷贝**，其实对于 select 来说，由于这个集合是保存在用户态的，所以当调用 select 时需要屡次的把这个描述符集合拷贝到内核空间。所以**如果要解决这个问题，可以直接把这个集合放在内核态进行管理**。没错，epoll 就是这样做的，epoll 在内核态创建了一颗红黑树，应用程序直接把需要监控的 socket 对象添加到这棵树上，直接从用户态到内核态了，而且后续也不需要再次拷贝了。
+针对第二点：**如何避免用户态和内核态对文件描述符集合的拷贝**，其实对于 select 来说，由于这个集合是保存在用户态的，所以当调用 select 时需要屡次的把这个描述符集合拷贝到内核空间。所以**如果要解决这个问题，可以直接把这个集合放在内核空间进行管理**。没错，epoll 就是这样做的，epoll 在内核空间创建了一颗红黑树，应用程序直接把需要监控的 socket 对象添加到这棵树上，直接从用户态到内核态了，而且后续也不需要再次拷贝了。
 
-> socket 就绪后，也就是 socket 上有事件触发了，操作系统就会唤醒这个 socket 的等待队列中的进程，通知进程 socket 就绪，可以开始处理了。但是对于 select 来说，由于进程监控的是多个 socket，在进程被唤醒后，进程知道有 socket 就绪了，但是不知道是哪一个 socket 就绪了。原因在于从 socket 就绪到唤醒进程是有需要一定的时间的，这段时间里有可能已经有第二个、第三个 ... socket 就绪了，所以它还需要再次遍历一遍这个描述符集合。
+> socket 就绪后，也就是 socket 上有事件触发了，操作系统就会唤醒这个 socket 的等待队列中的进程，通知进程 socket 就绪，可以开始处理了。但是对于 select 来说，由于**进程监控的是多个 socket，在进程被唤醒后，进程只知道有 socket 就绪了，但是不知道是哪一个 socket 就绪**了。原因在于从 socket 就绪到唤醒进程是有需要一定的时间的，这段时间里有可能已经有第二个、第三个 ... socket 就绪了，所以它还需要再次遍历一遍这个描述符集合。
 
-针对第三点：**socket就绪后，如何避免内核线性遍历文件描述符集合**，这个问题就会比较复杂，要完整理解就得涉及到内核收包到应用层的整个过程。这里先简单讲一下，与 select 不同，epoll 使用了一个双向链表来保存就绪的 socket，这样当活跃连接数不多的情况下，应用程序只需要遍历这个就绪链表就行了，而 select 没有这样一个用来存储就绪 socket 的东西，导致每次需要线性遍历这个集合，以确定是哪个或者哪几个 socket 就绪了。
+针对第三点：**socket就绪后，如何避免内核线性遍历文件描述符集合**，这个问题就会比较复杂，要完整理解就得涉及到内核收包到应用层的整个过程。这里先简单讲一下，与 select 不同，epoll 使用了一个双向链表来保存就绪的 socket，这样当活跃连接数不多的情况下，应用程序只需要遍历这个就绪链表就行了，而 select 没有这样一个用来存储就绪 socket 的东西，导致每次需要线性遍历这个集合，以确定是哪个或者哪几个 socket 就绪了。这里需要注意的是，**这个就绪链表保存活跃链接，数量是较少的，也需要从内核空间拷贝到用户空间**。
 
 从上面 3 点可以看到 epoll 的几个特点：
 
-+ **内核开辟一块缓存，用来管理 epoll 红黑树，高效添加和删除**
-+ **红黑树位于内核空间，直接管理 socket，减少和用户态的交互**
++ **程序在内核空间开辟一块缓存，用来管理 epoll 红黑树，高效添加和删除**
++ **红黑树位于内核空间，用来直接管理 socket，减少和用户态的交互**
 + **使用双向链表缓存就绪的 socket，数量较少**
-+ **只需要拷贝这个双向链表到用户空间，再遍历就行**
++ **只需要拷贝这个双向链表到用户空间，再遍历就行，注意这里也需要拷贝，没有共享内存**
 
 比较精炼的话可能反而理解起来不容易，那么接下来深入分析一下 epoll 的原理。
 
-## 红黑树的创建和管理
+## epoll api
+
+如果要深入分析 epoll 的原理，那么可能需要结合到 epoll 的 api 来进行阐述。epoll api 较少，使用起来相对比较简单。
+
+
+```
+#include <sys/epoll.h>
+
+# open an epoll file descriptor
+# epoll_create1 可以理解为 epoll_create 的增强版（主要支持了 close-on-exec）
+int epoll_create(int size);
+int epoll_create1(int flags);
+
+# 往 epoll instance 上添加、删除、更改一个节点（socket)
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+
+# wait for events on epoll instance
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+
+# close and clear epoll instance
+int close(int fd);
+```
+
+epoll 涉及到的 api 其实比较简单，掌握了这几个 api 其实就已经能够快速编写基于 epoll 的 tcp/udp socket 程序。可以参考：
+
+[https://github.com/smaugx/epoll_examples.git](https://github.com/smaugx/epoll_examples.git)
+
+
+**接下来结合上面的几个 api 来详细分析以下背后的原理**。
+
+
+## 红黑树的创建和操作
 
 前面提到，epoll 是一种 IO 多路复用机制，应用程序可以同时监控多个 socket，那么如何来存储和管理这些 socket 呢，epoll 使用的是一颗红黑树，可以随意的往这棵树上添加节点和删除节点(节点是一个结构体，包括 socket fd)。
 
-而且由于考虑效率问题，**epoll 是直接在内核空间申请了一块内存来创建这棵 epoll 树**，应用程序可以往这棵树上添加需要监控的 socket，或者删除某个 socket。使用红黑树的原因，应该是为了查找、插入、删除的效率考虑，当需要管理百万级别甚至千万级别连接时，如何快速的插入以及删除 socket 就显得很重要，红黑树能够提供 O(log(n)) 的复杂度。
+我们使用：
+
+```
+int epoll_create(int size);
+```
+
+创建一个 epoll instance，实际上是创建了一个  **eventpoll** 实例，包含了**红黑树**以及一个**双向链表**。
+
+> 可以直接查看 linux 源码：[https://github.com/torvalds/linux/blob/master/fs/eventpoll.c#L181](https://github.com/torvalds/linux/blob/master/fs/eventpoll.c#L181)
+
+```
+/*
+ * This structure is stored inside the "private_data" member of the file
+ * structure and represents the main data structure for the eventpoll
+ * interface.
+ */
+struct eventpoll {
+    ...
+    
+	/* List of ready file descriptors */
+	struct list_head rdllist;
+
+	/* RB tree root used to store monitored fd structs */
+	struct rb_root_cached rbr;
+	
+	...
+};
+```
+
+这个 eventpoll 实例是直接位于内核空间的。红黑树的叶子节点都是 **epitem** 结构体：
+
+> 可以直接查看 linux 源码： [https://github.com/torvalds/linux/blob/master/fs/eventpoll.c#L137](https://github.com/torvalds/linux/blob/master/fs/eventpoll.c#L137)
+
+
+```
+struct epitem {
+   ...
+   
+	union {
+		/* RB tree node links this structure to the eventpoll RB tree */
+		struct rb_node rbn;
+		/* Used to free the struct epitem */
+		struct rcu_head rcu;
+	};
+
+	/* List header used to link this structure to the eventpoll ready list */
+	struct list_head rdllink;
+
+	/* The file descriptor information this item refers to */
+	struct epoll_filefd ffd;
+
+	/* The "container" of this item */
+	struct eventpoll *ep;
+
+	/* List header used to link this item to the "struct file" items list */
+	struct list_head fllink;
+
+	/* wakeup_source used when EPOLLWAKEUP is set */
+	struct wakeup_source __rcu *ws;
+
+	/* The structure that describe the interested events and the source fd */
+	struct epoll_event event;
+	
+	...
+};
+```
+
+关于各项的解释，注释里已经说的比较清楚了。我们关心的应该是，当往这棵红黑树上添加、删除、修改节点的时候，我们从（用户态）程序代码中能操作的是一个 fd，即一个 socket 对应的 file descriptor，所以一个 epitem 实例与一个 socket fd 一一对应。
+
+另外还需要注意到的是 rdllink 这个变量，这个指向了上一步创建的 evnetpoll 实例中的成员变量 rdllist，也就是那个就绪链表。**这里很重要，注意留意，后面会讲到**。
+
+当然，我们还需要关注的是 event 这个变量，代表了我们针对这个 socket fd 关心的事件，比如 EPOLLIN、EPOLLOUT。
+
+通过上述的讲解应该大致明白了，当我们使用 socket() 或者 accept() 得到一个 socket fd 时，我们添加到这棵红黑树上的是一个结构体，与这个 socket fd 一一对应。
+
+那么修改和删除呢？
+
+也是类似的过程，使用 ffd 变量作为红黑树比较的 key，能够快速的查找和插入。具体我们使用的是：
+
+```
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+```
+
+## 如何触发事件
+上面过程已经把我们关心的 socket 添加到 epoll instance 中了，那么当某个 socket 有事件触发时，epoll 是如何感知并通知（用户态）应用程序呢？
+
+要完整的回答这个问题，会涉及到比较多的知识。不过为了了解 epoll 的原理，有一些知识需要提前了解。
+
+### 内核收包路径
+> 当一个包从网卡进来之后，是如何走到应用程序的呢？中间经过了哪些步骤呢？（本文会讲的比较简略一点）
+
+包从硬件网卡（NIC) 上进来之后，会触发一个**中断**，告诉 cpu 网卡上有包过来了，需要处理，同时通过 DMA（direct memory access) 的方式把包存放到内存的某个地方，这块内存通常称为 ring buffer，是网卡驱动程序初始化时候分配的。
+
+> **中断** 的原理学过微机原理的应该都知道，表示处理器接收到来自硬件或者软甲的信号，提示产生了某件事情，需要处理。
+
+当 cpu 收到这个中断后，会调用中断处理程序，这里的中断处理程序就是网卡驱动程序，因为网络硬件设备网卡需要驱动才能工作。网卡驱动会先关闭网卡上的中断请求，表示已经知晓网卡上有包进来的事情，同时也避免在处理过程中网卡再次触发中断，干扰或者降低处理性能。驱动程序启动软中断，继续处理数据包。
+
+然后 CPU 激活 NAPI 子系统，由 NAPI 子系统来处理由网卡放到内存的数据包。经过一些列内核代码，最终数据包来到内核协议栈。内核协议栈也就是 IP 层以及传输层。经过 IP 层之后，数据包到达传输层，内核根据数据包里面的 `{src_ip:src_port, dst_ip:dst_port}` 找到相应的 socket。
+
+> 为了性能，内核应该是有一个四元组和 socket 句柄的一一映射关系。
+
+然后把数据包放到这个 socket 的接收队列（接收缓冲区）中，准备通知应用程序，socket 就绪。
+
+### 从 socket 到应用程序
+上面比较简略的描述了一个数据包从网卡到内核协议栈，再到 socket 的接收缓冲区的步骤，描述的比较简略，不影响对 epoll 原理的理解，这里只需要有这个概念就行。
+
+那么当 socket 就绪后，也就是数据包被放到 socket 的接收缓冲区后，如何通知应用程序呢？这里用到的是**等待队列**，也就是 **wait queue**。关于 wait queue 的应用，在 linux 内核代码里有很多，具体可以看一下 wait queue 的定义：
+
+[https://github.com/torvalds/linux/blob/master/include/linux/wait.h](https://github.com/torvalds/linux/blob/master/include/linux/wait.h)
+
+当我们通过 socket() 以及 accept() 获取到一个 socket 对象时，这个 socket 对象到底有哪些东西呢？
+
+> 可以直接参考 [https://github.com/torvalds/linux/blob/master/include/linux/net.h#L113](https://github.com/torvalds/linux/blob/master/include/linux/net.h#L113)
+
+```
+/**
+ *  struct socket - general BSD socket
+ *  @state: socket state (%SS_CONNECTED, etc)
+ *  @type: socket type (%SOCK_STREAM, etc)
+ *  @flags: socket flags (%SOCK_NOSPACE, etc)
+ *  @ops: protocol specific socket operations
+ *  @file: File back pointer for gc
+ *  @sk: internal networking protocol agnostic socket representation
+ *  @wq: wait queue for several uses
+ */
+struct socket {
+	socket_state		state;
+
+	short			type;
+
+	unsigned long		flags;
+
+	struct file		*file;
+	struct sock		*sk;
+	const struct proto_ops	*ops;
+
+	struct socket_wq	wq;
+};
+
+
+struct socket_wq {
+	/* Note: wait MUST be first field of socket_wq */
+	wait_queue_head_t	wait;
+	struct fasync_struct	*fasync_list;
+	unsigned long		flags; /* %SOCKWQ_ASYNC_NOSPACE, etc */
+	struct rcu_head		rcu;
+} ____cacheline_aligned_in_smp;
+```
+
+可以看到，一个 socket 实例包含了一个 file 的指针，以及一个 socket\_wq 变量。其中 socket\_wq 中的 **wait 表示等待队列，fasync_list 表示异步等待队列**。
+
+那么等待队列和异步等待队列中有什么呢？大致来说，**等待队列和异步等待队列中存放的是关注这个 socket 上的事件的进程**。区别是等待队列中的进程会被处于阻塞状态，处于异步等待队列中的进程不会阻塞。
+
+> 阻塞的概念学过操作系统的应该知道，阻塞是进程的一种状态，表示一个进程正在等待某件事情的发生而暂时停止运行；另外还有运行状态以及就绪状态。
+
+当 socket 就绪后（接收缓冲区有数据），那么就会 wake up 等待队列中的进程，通知进程 socket 上有事件，可以开始处理了。
+
+
+至此，一个数据包从网卡最终达到应用程序内部了。
+
+**再简单总结一下收包以及触发的过程**：
+
++ **包从网卡进来**
++ **一路经过各个子系统到达内核协议栈（传输层）**
++ **内核根据包的 `{src_ip:src_port, dst_ip:dst_port}` 找到 socket 对象（内核维护了一份四元组和 socket 对象的一一映射表）**
++ **数据包被放到 socket 对象的接收缓冲区**
++ **内核唤醒 socket 对象上的等待队列中的进程，通知 socket 事件**
++ **进程唤醒，处理 socket 事件（read/write)**
+
+
+
+## epoll 的触发
+上面其实是对内核收包以及事件触发的综合描述，涉及到 epoll 后，稍微有点差异。
+
+上面其实提到了**等待队列**，每当我们创建一个 socket 后（无论是 socket()函数 还是 accept() 函数)，socket 对象中会有一个进程的等待队列，表示某个或者某些进程在等待这个 socket 上的事件。
+
+但是当我们往 epoll 红黑树上添加一个 epitem 节点（也就是一个 socket 对象，或者说一个 fd)后，**实际上还会在这个 socket 对象的 wait queue 上注册一个 callback function，当这个 socket 上有事件发生后就会调用这个 callback function**。这里与上面讲到的不太一样，并不会直接 wake up 一个等待进程，需要注意一下。
+
+简单讲就是，**这个 socket 在添加到这棵 epoll 树上时，会在这个 socket 的 wait queue 里注册一个回调函数，当有事件发生的时候再调用这个回调函数（而不是唤醒进程）**。
+
+下面简单贴一下 epoll 中关于注册这个回调函数的部分代码：
+
+```
+/*
+ * This is the callback that is used to add our wait queue to the
+ * target file wakeup lists.
+ */
+static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
+				 poll_table *pt)
+{
+	struct epitem *epi = ep_item_from_epqueue(pt);
+	struct eppoll_entry *pwq;
+
+	if (epi->nwait >= 0 && (pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL))) {
+		init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);   // 注册回调函数到等待队列上
+		pwq->whead = whead;
+		pwq->base = epi;
+		if (epi->event.events & EPOLLEXCLUSIVE)
+			add_wait_queue_exclusive(whead, &pwq->wait);
+		else
+			add_wait_queue(whead, &pwq->wait);
+		list_add_tail(&pwq->llink, &epi->pwqlist);
+		epi->nwait++;
+	} else {
+		/* We have to signal that an error occurred */
+		epi->nwait = -1;
+	}
+}
+```
+
+那么这个回调函数做了什么事呢？
+
+很简单，这个回调函数会把这个 socket 添加到 
+
 
 
