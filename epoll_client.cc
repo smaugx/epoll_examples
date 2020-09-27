@@ -16,13 +16,15 @@
 #include <functional>
 #include <thread>
 
+// actually no need to implement a tcp client using epoll
+
 
 namespace mux {
 
 namespace transport {
 
-static const uint32_t kEpollWaitTime = 10; // 10 ms
-static const uint32_t kMaxEvents = 100;
+static const uint32_t kEpollWaitTime = 10; // epoll wait timeout 10 ms
+static const uint32_t kMaxEvents = 100;    // epoll wait return max size
 
 typedef struct Packet {
 public:
@@ -34,14 +36,16 @@ public:
         : fd(fd),
           msg(msg) {}
 
-    int fd { -1 };
-    std::string msg;
+    int fd { -1 };     // meaning socket
+    std::string msg;   // real binary content
 } Packet;
 
 typedef std::shared_ptr<Packet> PacketPtr;
 
+// callback when packet received
 using callback_recv_t = std::function<void(const PacketPtr& data)>;
 
+// base class of EpollTcpServer, focus on Start(), Stop(), SendData(), RegisterOnRecvCallback()...
 class EpollTcpBase {
 public:
     EpollTcpBase()                                     = default;
@@ -65,6 +69,7 @@ typedef std::shared_ptr<ETBase> ETBasePtr;
 
 
 
+// the implementation of Epoll Tcp client
 class EpollTcpClient : public ETBase {
 public:
     EpollTcpClient()                                       = default;
@@ -74,33 +79,45 @@ public:
     EpollTcpClient& operator=(EpollTcpClient&& other)      = delete;
     ~EpollTcpClient() override;
 
+    // the server ip and port
     EpollTcpClient(const std::string& server_ip, uint16_t server_port);
 
 public:
+    // start tcp client
     bool Start() override;
+    // stop tcp client
     bool Stop() override;
+    // send packet
     int32_t SendData(const PacketPtr& data) override;
+    // register a callback when packet received
     void RegisterOnRecvCallback(callback_recv_t callback) override;
     void UnRegisterOnRecvCallback() override;
 
 protected:
+    // create epoll instance using epoll_create and return a fd of epoll
     int32_t CreateEpoll();
+    // create a socket fd using api socket()
     int32_t CreateSocket();
+    // connect to server
     int32_t Connect(int32_t listenfd);
+    // add/modify/remove a item(socket/fd) in epoll instance(rbtree), for this example, just add a socket to epoll rbtree
     int32_t UpdateEpollEvents(int efd, int op, int fd, int events);
+    // handle tcp socket readable event(read())
     void OnSocketRead(int32_t fd);
+    // handle tcp socket writeable event(write())
     void OnSocketWrite(int32_t fd);
+    // one loop per thread, call epoll_wait and return ready socket(readable,writeable,error...)
     void EpollLoop();
 
 
 private:
-    std::string server_ip_;
-    uint16_t server_port_ { 0 };
+    std::string server_ip_; // tcp server ip
+    uint16_t server_port_ { 0 }; // tcp server port
     int32_t handle_ { -1 }; // client fd
     int32_t efd_ { -1 }; // epoll fd
-    std::shared_ptr<std::thread> th_loop_ { nullptr };
-    bool loop_flag_ { true };
-    callback_recv_t recv_callback_ { nullptr };
+    std::shared_ptr<std::thread> th_loop_ { nullptr }; // one loop per thread(call epoll_wait in loop)
+    bool loop_flag_ { true }; // if loop_flag_ is false, then exit the epoll loop
+    callback_recv_t recv_callback_ { nullptr }; // callback when received
 };
 
 using ETClient = EpollTcpClient;
@@ -119,6 +136,7 @@ EpollTcpClient::~EpollTcpClient() {
 }
 
 bool EpollTcpClient::Start() {
+    // create epoll instance
     if (CreateEpoll() < 0) {
         return false;
     }
@@ -128,6 +146,7 @@ bool EpollTcpClient::Start() {
         return false;
     }
 
+    // connect to server
     int lr = Connect(cli_fd);
     if (lr < 0) {
         return false;
@@ -135,24 +154,29 @@ bool EpollTcpClient::Start() {
     std::cout << "EpollTcpClient Init success!" << std::endl;
     handle_ = cli_fd;
 
+    // after connected successfully, add this socket to epoll instance, and focus on EPOLLIN and EPOLLOUT event
     int er = UpdateEpollEvents(efd_, EPOLL_CTL_ADD, handle_, EPOLLIN | EPOLLET);
     if (er < 0) {
+        // if something goes wrong, close listen socket and return false
         ::close(handle_);
         return false;
     }
 
     assert(!th_loop_);
 
+    // the implementation of one loop per thread: create a thread to loop epoll
     th_loop_ = std::make_shared<std::thread>(&EpollTcpClient::EpollLoop, this);
     if (!th_loop_) {
         return false;
     }
+    // detach the thread(using loop_flag_ to control the start/stop of loop)
     th_loop_->detach();
 
     return true;
 }
 
 
+// stop epoll tcp client and release epoll
 bool EpollTcpClient::Stop() {
     loop_flag_ = false;
     ::close(handle_);
@@ -163,8 +187,10 @@ bool EpollTcpClient::Stop() {
 }
 
 int32_t EpollTcpClient::CreateEpoll() {
+    // the basic epoll api of create a epoll instance
     int epollfd = epoll_create(1);
     if (epollfd < 0) {
+        // if something goes wrong, return -1
         std::cout << "epoll_create failed!" << std::endl;
         return -1;
     }
@@ -173,6 +199,7 @@ int32_t EpollTcpClient::CreateEpoll() {
 }
 
 int32_t EpollTcpClient::CreateSocket() {
+    // create tcp socket
     int cli_fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (cli_fd < 0) {
         std::cout << "create socket failed!" << std::endl;
@@ -182,6 +209,7 @@ int32_t EpollTcpClient::CreateSocket() {
     return cli_fd;
 }
 
+// connect to tcp server
 int32_t EpollTcpClient::Connect(int32_t cli_fd) {
     struct sockaddr_in addr;  // server info
     memset(&addr, 0, sizeof(addr));
@@ -197,6 +225,7 @@ int32_t EpollTcpClient::Connect(int32_t cli_fd) {
     return 0;
 }
 
+// add/modify/remove a item(socket/fd) in epoll instance(rbtree), for this example, just add a socket to epoll rbtree
 int32_t EpollTcpClient::UpdateEpollEvents(int efd, int op, int fd, int events) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
@@ -211,6 +240,7 @@ int32_t EpollTcpClient::UpdateEpollEvents(int efd, int op, int fd, int events) {
     return 0;
 }
 
+// register a callback when packet received
 void EpollTcpClient::RegisterOnRecvCallback(callback_recv_t callback) {
     assert(!recv_callback_);
     recv_callback_ = callback;
@@ -231,6 +261,7 @@ void EpollTcpClient::OnSocketRead(int32_t fd) {
         std::string msg(read_buf, n);
         PacketPtr data = std::make_shared<Packet>(fd, msg);
         if (recv_callback_) {
+            // handle recv packet
             recv_callback_(data);
         }
     }
@@ -269,7 +300,9 @@ int32_t EpollTcpClient::SendData(const PacketPtr& data) {
     return r;
 }
 
+// one loop per thread, call epoll_wait and handle all coming events
 void EpollTcpClient::EpollLoop() {
+    // request some memory, if events ready, socket events will copy to this memory from kernel
     struct epoll_event* alive_events =  static_cast<epoll_event*>(calloc(kMaxEvents, sizeof(epoll_event)));
     if (!alive_events) {
         std::cout << "calloc memory failed for epoll_events!" << std::endl;
@@ -325,6 +358,7 @@ int main(int argc, char* argv[]) {
         server_port = std::atoi(argv[2]);
     }
 
+    // create a tcp client
     auto tcp_client = std::make_shared<EpollTcpClient>(server_ip, server_port);
     if (!tcp_client) {
         std::cout << "tcp_client create faield!" << std::endl;
@@ -332,13 +366,17 @@ int main(int argc, char* argv[]) {
     }
 
 
+    // recv callback in lambda mode, you can set your own callback here
     auto recv_call = [&](const transport::PacketPtr& data) -> void {
+        // just print recv data to stdout
         std::cout << "recv: " << data->msg << std::endl;
         return;
     };
 
+    // register recv callback to epoll tcp client
     tcp_client->RegisterOnRecvCallback(recv_call);
 
+    // start the epoll tcp client
     if (!tcp_client->Start()) {
         std::cout << "tcp_client start failed!" << std::endl;
         exit(1);
@@ -347,6 +385,7 @@ int main(int argc, char* argv[]) {
 
     std::string msg;
     while (true) {
+        // read content from stdin
         std::cout << std::endl << "input:";
         std::getline(std::cin, msg);
         auto packet = std::make_shared<Packet>(msg);
